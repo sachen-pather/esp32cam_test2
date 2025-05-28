@@ -1,0 +1,268 @@
+#include <Arduino.h>
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <WebServer.h>
+
+// Camera pins for AI Thinker ESP32-CAM
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+// LED pin
+#define LED_PIN           33
+
+// WiFi network credentials - creates its own access point
+const char* ssid = "ESP32-CAM-AP";
+const char* password = "12345678";
+
+// Web server on port 80
+WebServer server(80);
+
+// Flag for camera initialization status
+bool isCameraInitialized = false;
+
+// Function prototypes
+void handleRoot();
+void handleCapture();
+void handleStream();
+
+void setup() {
+  // Initialize LED
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+  
+  // Initialize serial (for debugging if needed)
+  Serial.begin(115200);
+  delay(1000);
+  
+  // Configure camera
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+  
+  // Higher quality settings
+  config.frame_size = FRAMESIZE_SVGA;    // 800x600 resolution
+  config.jpeg_quality = 6;               // Better quality (0-63, lower is better)
+  config.fb_count = 2;                   // 2 frame buffers for better performance
+  
+  // Initialize camera
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed with error 0x%x\n", err);
+    // Error blink pattern
+    for (int i = 0; i < 5; i++) {
+      digitalWrite(LED_PIN, HIGH);
+      delay(100);
+      digitalWrite(LED_PIN, LOW);
+      delay(100);
+    }
+    isCameraInitialized = false;
+  } else {
+    Serial.println("Camera initialized successfully");
+    isCameraInitialized = true;
+    
+    // Get sensor and apply better settings
+    sensor_t * s = esp_camera_sensor_get();
+    if (s) {
+      // Adjust sensor parameters for better image quality
+      s->set_brightness(s, 2);        // -2 to 2
+      s->set_contrast(s, -1);          // -2 to 2
+      s->set_saturation(s, 1);        // -2 to 2
+      s->set_sharpness(s, 1);         // -2 to 2
+      s->set_denoise(s, 1);           // 0 to 1
+      s->set_quality(s, 8);           // 0-63 (lower is better quality)
+      s->set_gainceiling(s, GAINCEILING_2X);  // GAINCEILING_2X, 4X, 8X, 16X
+      s->set_whitebal(s, 1);          // 0 = disable, 1 = enable
+      s->set_awb_gain(s, 1);          // 0 = disable, 1 = enable
+      s->set_wb_mode(s, 0);           // 0 to 4
+      s->set_exposure_ctrl(s, 1);     // 0 = disable, 1 = enable
+      s->set_aec2(s, 1);              // 0 = disable, 1 = enable auto bright detection
+      s->set_gain_ctrl(s, 1);         // 0 = disable, 1 = enable
+      
+      Serial.println("Camera settings optimized");
+    }
+    
+    // Success blink pattern
+    digitalWrite(LED_PIN, HIGH);
+    delay(1000);
+    digitalWrite(LED_PIN, LOW);
+  }
+  
+  // Set up Access Point
+  WiFi.softAP(ssid, password);
+  IPAddress IP = WiFi.softAPIP();
+  Serial.print("AP IP address: ");
+  Serial.println(IP);
+  
+  // Set up web server routes
+  server.on("/", handleRoot);
+  server.on("/capture", handleCapture);
+  server.on("/stream", handleStream);
+  
+  // Start server
+  server.begin();
+  Serial.println("HTTP server started");
+  
+  // Server started blink pattern
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(LED_PIN, HIGH);
+    delay(200);
+    digitalWrite(LED_PIN, LOW);
+    delay(200);
+  }
+}
+
+void loop() {
+  // Handle client requests
+  server.handleClient();
+  
+  // Blink LED periodically to show the server is running
+  static unsigned long lastBlink = 0;
+  if (millis() - lastBlink > 3000) {
+    digitalWrite(LED_PIN, HIGH);
+    delay(50);
+    digitalWrite(LED_PIN, LOW);
+    lastBlink = millis();
+  }
+}
+
+// Serve the main page with enhanced UI
+void handleRoot() {
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<title>ESP32-CAM Web Server</title>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<style>";
+  html += "body{font-family:Arial;text-align:center;margin:0;background-color:#f4f4f4;}";
+  html += ".container{max-width:800px;margin:0 auto;padding:20px;}";
+  html += "img{max-width:100%;width:auto;height:auto;border-radius:10px;border:1px solid #ddd;}";
+  html += "button{background-color:#4CAF50;border:none;color:white;padding:15px 32px;";
+  html += "text-align:center;text-decoration:none;display:inline-block;font-size:16px;";
+  html += "margin:10px 5px;cursor:pointer;border-radius:8px;box-shadow:0 4px 8px rgba(0,0,0,0.1);}";
+  html += "button:hover{background-color:#45a049;transform:translateY(-2px);transition:0.2s;}";
+  html += "h1{color:#333;text-shadow:1px 1px 2px #ccc;}";
+  html += ".button-container{margin:20px 0;}";
+  html += "</style></head>";
+  html += "<body><div class='container'>";
+  html += "<h1>ESP32-CAM Web Server</h1>";
+  
+  if (!isCameraInitialized) {
+    html += "<p style='color:red;font-weight:bold;padding:20px;background-color:#ffeeee;border-radius:5px;'>Error: Camera initialization failed</p>";
+  } else {
+    html += "<div class='button-container'>";
+    html += "<button onclick=\"window.location.href='/capture'\">Take Photo</button>";
+    html += "<button onclick=\"window.location.href='/stream'\">Live Stream</button>";
+    html += "</div>";
+    html += "<p>Camera is working! Click a button above to start.</p>";
+    
+    // Show camera info
+    html += "<div style='margin-top:30px;text-align:left;background-color:#e8e8e8;padding:15px;border-radius:8px;'>";
+    html += "<h3>Camera Information:</h3>";
+    html += "<p>Resolution: 800x600 (SVGA)</p>";
+    html += "<p>Quality: High</p>";
+    html += "<p>ESP32-CAM IP: " + WiFi.softAPIP().toString() + "</p>";
+    html += "</div>";
+  }
+  
+  html += "</div></body></html>";
+  
+  server.send(200, "text/html", html);
+}
+
+// Capture and send a photo
+void handleCapture() {
+  if (!isCameraInitialized) {
+    server.send(500, "text/plain", "Camera not initialized");
+    return;
+  }
+  
+  digitalWrite(LED_PIN, HIGH); // Turn on LED for photo
+  
+  // Capture frame
+  camera_fb_t * fb = esp_camera_fb_get();
+  digitalWrite(LED_PIN, LOW); // Turn off LED
+  
+  if (!fb) {
+    Serial.println("Camera capture failed");
+    server.send(500, "text/plain", "Camera capture failed");
+    return;
+  }
+  
+  // Send the image
+  server.sendHeader("Content-Type", "image/jpeg");
+  server.sendHeader("Content-Disposition", "inline; filename=capture.jpg");
+  server.sendHeader("Content-Length", String(fb->len));
+  server.send_P(200, "image/jpeg", (const char*)fb->buf, fb->len);
+  
+  // Return the frame buffer back to be reused
+  esp_camera_fb_return(fb);
+}
+
+// Handle streaming with enhanced UI
+void handleStream() {
+  if (!isCameraInitialized) {
+    server.send(500, "text/plain", "Camera not initialized");
+    return;
+  }
+  
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<title>ESP32-CAM Stream</title>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<style>";
+  html += "body{font-family:Arial;text-align:center;margin:0;background-color:#f4f4f4;}";
+  html += ".container{max-width:800px;margin:0 auto;padding:20px;}";
+  html += "img{max-width:100%;width:auto;height:auto;border-radius:10px;border:1px solid #ddd;}";
+  html += "button{background-color:#4CAF50;border:none;color:white;padding:12px 24px;";
+  html += "text-align:center;text-decoration:none;display:inline-block;font-size:16px;";
+  html += "margin:10px 5px;cursor:pointer;border-radius:8px;box-shadow:0 4px 8px rgba(0,0,0,0.1);}";
+  html += "button:hover{background-color:#45a049;transform:translateY(-2px);transition:0.2s;}";
+  html += "h1{color:#333;text-shadow:1px 1px 2px #ccc;}";
+  html += "</style></head>";
+  html += "<body><div class='container'>";
+  html += "<h1>ESP32-CAM Live Stream</h1>";
+  html += "<p><button onclick=\"window.location.href='/'\">Back to Home</button></p>";
+  html += "<div style='margin:10px 0;padding:10px;background:white;border-radius:10px;box-shadow:0 4px 8px rgba(0,0,0,0.1);'>";
+  html += "<img src='/capture' id='stream' alt='Camera Stream'>";
+  html += "</div>";
+  html += "<p style='font-size:14px;color:#666;'>Stream refreshes automatically (5 FPS)</p>";
+  html += "<script>";
+  html += "var img = document.getElementById('stream');";
+  html += "function refreshImage() {";
+  html += "  img.src = '/capture?t=' + new Date().getTime();";
+  html += "}";
+  html += "setInterval(refreshImage, 200);"; // 200ms refresh (5 fps)
+  html += "</script>";
+  html += "</div></body></html>";
+  
+  server.send(200, "text/html", html);
+}

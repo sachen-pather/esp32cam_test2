@@ -1,0 +1,806 @@
+#include <Arduino.h>
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <WebServer.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include "esp_wpa2.h"
+
+// Camera pins for AI Thinker ESP32-CAM
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+// LED pins
+#define LED_PIN           33
+#define FLASH_PIN         4
+
+// WiFi credentials for mobile hotspot
+const char* ssid = "LA";        // Replace with your mobile hotspot name
+const char* password = "password"; // Replace with your mobile hotspot password
+
+// Backend settings - Updated to HTTPS port 7061
+const char* backendHost = "honey-badger-detection20250524205314.azurewebsites.net";
+const int backendPort = 443;
+const char* analyzeEndpoint = "/api/Camera/analyze";
+
+WebServer server(80);
+bool isCameraInitialized = false;
+bool isConnectedToWifi = false;
+
+// Enhanced HTML with debugging log display
+const char MINIMAL_HOME_HTML[] PROGMEM = R"(
+<!DOCTYPE html><html><head><title>ESP32-CAM Honey Badger Detector</title>
+<meta name='viewport' content='width=device-width,initial-scale=1'>
+<style>
+body{font-family:Arial;text-align:center;padding:20px;background:#f4f4f4;margin:0}
+.container{max-width:800px;margin:0 auto;background:white;padding:20px;border-radius:10px;box-shadow:0 4px 8px rgba(0,0,0,0.1)}
+h1{color:#333;margin-bottom:30px}
+button{background:#4CAF50;color:white;padding:15px 30px;border:none;border-radius:8px;margin:10px;cursor:pointer;font-size:16px;box-shadow:0 2px 4px rgba(0,0,0,0.2)}
+button:hover{background:#45a049;transform:translateY(-2px);transition:0.2s}
+button:disabled{background:#ccc;cursor:not-allowed;transform:none}
+.test-btn{background:#2196F3;}
+.test-btn:hover{background:#1976D2;}
+.clear-btn{background:#ff9800;}
+.clear-btn:hover{background:#f57c00;}
+#status{margin:20px 0;padding:15px;border-radius:8px;font-size:18px;font-weight:bold}
+.ready{background:#e7f7e7;color:#2e7d32}
+.processing{background:#fff3cd;color:#856404}
+.detected{background:#d4edda;color:#155724}
+.not-detected{background:#f8d7da;color:#721c24}
+.error{background:#f8d7da;color:#721c24}
+.info{background:#e8e8e8;color:#333;font-size:14px;margin-top:20px;text-align:left;padding:10px}
+.debug-log{background:#1e1e1e;color:#00ff00;font-family:monospace;font-size:12px;text-align:left;padding:15px;margin:20px 0;border-radius:8px;max-height:400px;overflow-y:auto;white-space:pre-wrap;word-wrap:break-word}
+.log-header{color:#fff;font-weight:bold;margin-bottom:10px}
+.timestamp{color:#888}
+</style></head>
+<body><div class='container'>
+<h1>🦡 Honey Badger Detector</h1>
+<div style='margin-bottom:20px'>
+<button id='detectBtn' onclick='captureAndAnalyze()'>Detect Honey Badger</button>
+<button class='test-btn' onclick='testConnection()'>Test Connection</button>
+<button class='clear-btn' onclick='clearLog()'>Clear Log</button>
+</div>
+<div id='status' class='ready'>Ready to capture and analyze</div>
+<div class='info'>
+<strong>Status:</strong><br>
+ESP32-CAM IP: {{ESP32_IP}}<br>
+Backend: {{BACKEND_INFO}}<br>
+Memory: {{MEMORY_INFO}} bytes free
+</div>
+<div class='debug-log'>
+<div class='log-header'>🔍 Debug Log</div>
+<div id='logContent'>System ready. Click "Test Connection" to verify backend connectivity.</div>
+</div>
+</div>
+<script>
+let isProcessing = false;
+
+function addLog(message, isError = false) {
+    const logContent = document.getElementById('logContent');
+    const timestamp = new Date().toLocaleTimeString();
+    const color = isError ? '#ff4444' : '#00ff00';
+    logContent.innerHTML += `<span class='timestamp'>[${timestamp}]</span> <span style='color:${color}'>${message}</span>\n`;
+    logContent.scrollTop = logContent.scrollHeight;
+}
+
+function clearLog() {
+    document.getElementById('logContent').innerHTML = 'Log cleared.\n';
+}
+
+async function testConnection() {
+    addLog('🔗 Testing backend connection...');
+    
+    try {
+        const response = await fetch('/test');
+        const result = await response.json();
+        
+        if (result.success) {
+            addLog(`✅ Connection test successful! Response: ${result.responseCode} in ${result.duration}ms`);
+            addLog(`📶 WiFi Signal: ${result.wifiSignal} dBm`);
+        } else {
+            addLog(`❌ Connection test failed: ${result.error}`, true);
+            addLog(`📡 Response code: ${result.responseCode}`, true);
+        }
+        
+        addLog(`🎯 Target URL: ${result.testURL}`);
+        addLog(`💾 Free heap: ${result.freeHeap} bytes`);
+        
+    } catch (error) {
+        addLog(`❌ Test request failed: ${error.message}`, true);
+    }
+}
+
+async function captureAndAnalyze(){
+    if(isProcessing) return;
+    
+    isProcessing = true;
+    const btn = document.getElementById('detectBtn');
+    const status = document.getElementById('status');
+    
+    btn.disabled = true;
+    btn.textContent = 'Processing...';
+    status.className = 'processing';
+    status.textContent = 'Capturing image and analyzing...';
+    
+    addLog('📸 Starting honey badger detection...');
+    
+    try {
+        const startTime = Date.now();
+        
+        addLog('🌐 Sending request to /api/analyze...');
+        const response = await fetch('/api/analyze', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'}
+        });
+        
+        addLog(`📡 Received response: ${response.status} ${response.statusText}`);
+        
+        if (!response.ok) {
+            throw new Error(`Server error: ${response.status}`);
+        }
+        
+        const result = await response.json();
+        const totalTime = Date.now() - startTime;
+        
+        // Log detailed response info
+        addLog(`⏱️ Total request time: ${totalTime}ms`);
+        if (result.httpDuration) {
+            addLog(`🔗 Backend processing time: ${result.httpDuration}ms`);
+        }
+        if (result.processingTime) {
+            addLog(`⚡ ESP32 processing time: ${result.processingTime}ms`);
+        }
+        
+        if (result.error) {
+            addLog(`❌ Analysis error: ${result.error}`, true);
+            if (result.code) {
+                addLog(`📡 HTTP code: ${result.code}`, true);
+            }
+            if (result.details) {
+                addLog(`🔍 Details: ${result.details}`, true);
+            }
+            if (result.serverResponse) {
+                addLog(`🖥️ Server response: ${result.serverResponse}`, true);
+            }
+            
+            status.className = 'error';
+            status.textContent = `Error: ${result.error}`;
+        } else if (result.isHoneyBadger) {
+            const confidence = (result.confidence * 100).toFixed(1);
+            addLog(`🦡 HONEY BADGER DETECTED! Confidence: ${confidence}%`);
+            
+            status.className = 'detected';
+            status.textContent = `🦡 Honey Badger Detected! Confidence: ${confidence}% (${totalTime}ms)`;
+        } else {
+            const confidence = ((1 - result.confidence) * 100).toFixed(1);
+            addLog(`❌ No honey badger found. Confidence: ${confidence}%`);
+            
+            status.className = 'not-detected';
+            status.textContent = `No Honey Badger Found. Confidence: ${confidence}% (${totalTime}ms)`;
+        }
+        
+    } catch (error) {
+        addLog(`❌ Request failed: ${error.message}`, true);
+        
+        status.className = 'error';
+        status.textContent = `Connection Error: ${error.message}`;
+    } finally {
+        isProcessing = false;
+        btn.disabled = false;
+        btn.textContent = 'Detect Honey Badger';
+        
+        addLog('✅ Detection process completed');
+        
+        // Auto-reset status after 10 seconds
+        setTimeout(() => {
+            if (!isProcessing) {
+                status.className = 'ready';
+                status.textContent = 'Ready to capture and analyze';
+            }
+        }, 10000);
+    }
+}
+
+// Add keyboard shortcut
+document.addEventListener('keydown', function(e) {
+    if (e.code === 'Space' && !isProcessing) {
+        e.preventDefault();
+        captureAndAnalyze();
+    }
+});
+
+// Auto-refresh status info every 30 seconds
+setInterval(async () => {
+    try {
+        const response = await fetch('/status');
+        const status = await response.json();
+        // Update status silently without logging
+    } catch (e) {
+        // Silent fail
+    }
+}, 30000);
+</script></body></html>
+)";
+
+void initCamera() {
+  Serial.println("Initializing camera...");
+  
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+  
+  // Memory-optimized settings for 4MB PSRAM
+  config.frame_size = FRAMESIZE_QVGA;    // 320x240 - good balance of quality vs size
+  config.jpeg_quality = 20;              // 20-25 is optimal for detection (lower = better quality)
+  config.fb_count = 1;                   // Single frame buffer saves ~40KB RAM
+  config.fb_location = CAMERA_FB_IN_PSRAM;
+  config.grab_mode = CAMERA_GRAB_LATEST;
+  
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed: 0x%x\n", err);
+    isCameraInitialized = false;
+    
+    // Error blink pattern
+    for (int i = 0; i < 5; i++) {
+      digitalWrite(LED_PIN, HIGH);
+      delay(100);
+      digitalWrite(LED_PIN, LOW);
+      delay(100);
+    }
+    return;
+  }
+  
+  // Optimize sensor settings for detection
+  sensor_t * s = esp_camera_sensor_get();
+  if (s) {
+    // Image quality settings
+    s->set_quality(s, 20);           // JPEG quality (0-63, lower = better)
+    s->set_brightness(s, 0);         // -2 to 2
+    s->set_contrast(s, 0);           // -2 to 2  
+    s->set_saturation(s, 0);         // -2 to 2
+    s->set_sharpness(s, 1);          // -2 to 2 (slight sharpening helps detection)
+    s->set_denoise(s, 1);            // Enable noise reduction
+    
+    // Auto-exposure and gain
+    s->set_gainceiling(s, GAINCEILING_2X);
+    s->set_exposure_ctrl(s, 1);      // Enable auto exposure
+    s->set_aec2(s, 1);               // Enable AEC algorithm
+    s->set_gain_ctrl(s, 1);          // Enable auto gain
+    
+    // White balance
+    s->set_whitebal(s, 1);           // Enable auto white balance
+    s->set_awb_gain(s, 1);           // Enable AWB gain
+    s->set_wb_mode(s, 0);            // Auto WB mode
+    
+    // Special effects
+    s->set_special_effect(s, 0);     // No special effects
+    s->set_vflip(s, 0);              // No vertical flip
+    s->set_hmirror(s, 0);            // No horizontal mirror
+    
+    Serial.println("Camera sensor optimized for detection");
+  }
+  
+  isCameraInitialized = true;
+  Serial.println("Camera initialized successfully");
+  
+  // Success blink pattern
+  digitalWrite(LED_PIN, HIGH);
+  delay(500);
+  digitalWrite(LED_PIN, LOW);
+}
+
+void initWiFi() {
+  Serial.println("Connecting to mobile hotspot...");
+  
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_STA);
+  
+  // Simple WPA2-PSK connection for mobile hotspot
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to " + String(ssid));
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+    delay(500);
+    Serial.print(".");
+    digitalWrite(LED_PIN, !digitalRead(LED_PIN)); // Blink during connection
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println();
+    Serial.println("WiFi connected successfully!");
+    Serial.println("IP address: " + WiFi.localIP().toString());
+    Serial.println("Signal strength: " + String(WiFi.RSSI()) + " dBm");
+    Serial.println("Gateway: " + WiFi.gatewayIP().toString());
+    Serial.println("DNS: " + WiFi.dnsIP().toString());
+    isConnectedToWifi = true;
+    
+    // Success pattern - 2 long blinks
+    for (int i = 0; i < 2; i++) {
+      digitalWrite(LED_PIN, HIGH);
+      delay(400);
+      digitalWrite(LED_PIN, LOW);
+      delay(400);
+    }
+  } else {
+    Serial.println();
+    Serial.println("WiFi connection failed!");
+    Serial.println("Make sure your mobile hotspot is:");
+    Serial.println("1. Turned on and broadcasting");
+    Serial.println("2. Using the correct SSID: " + String(ssid));
+    Serial.println("3. Using the correct password");
+    Serial.println("4. Within range of the ESP32");
+    isConnectedToWifi = false;
+    
+    // Failure pattern - 3 short blinks
+    for (int i = 0; i < 3; i++) {
+      digitalWrite(LED_PIN, HIGH);
+      delay(150);
+      digitalWrite(LED_PIN, LOW);
+      delay(150);
+    }
+  }
+}
+
+// Enhanced API endpoint with detailed error responses for web logging
+void handleAnalyzeAPI() {
+  String debugInfo = "";  // Collect debug info for web display
+  
+  if (!isCameraInitialized) {
+    server.send(503, "application/json", "{\"error\":\"Camera not initialized\",\"debug\":\"Camera initialization failed during startup\"}");
+    return;
+  }
+  
+  if (!isConnectedToWifi) {
+    server.send(503, "application/json", "{\"error\":\"WiFi not connected\",\"debug\":\"WiFi connection lost or never established\"}");
+    return;
+  }
+  
+  // Check WiFi status in real-time
+  if (WiFi.status() != WL_CONNECTED) {
+    String wifiDebug = "WiFi status: " + String(WiFi.status()) + ", Expected: " + String(WL_CONNECTED);
+    server.send(503, "application/json", "{\"error\":\"WiFi connection lost\",\"debug\":\"" + wifiDebug + "\"}");
+    return;
+  }
+  
+  debugInfo += "WiFi Signal: " + String(WiFi.RSSI()) + " dBm; ";
+  debugInfo += "Free heap before: " + String(ESP.getFreeHeap()) + " bytes; ";
+  
+  unsigned long startTime = millis();
+  
+  // Capture image with flash
+  digitalWrite(FLASH_PIN, HIGH);
+  delay(50);
+  
+  camera_fb_t * fb = esp_camera_fb_get();
+  digitalWrite(FLASH_PIN, LOW);
+  
+  if (!fb) {
+    server.send(500, "application/json", "{\"error\":\"Camera capture failed\",\"debug\":\"Frame buffer allocation failed - possible memory issue\"}");
+    return;
+  }
+  
+  debugInfo += "Image: " + String(fb->width) + "x" + String(fb->height) + " (" + String(fb->len) + " bytes); ";
+  debugInfo += "Free heap after capture: " + String(ESP.getFreeHeap()) + " bytes; ";
+  
+  // Test connectivity to backend first
+ String backendURL = "https://" + String(backendHost) + analyzeEndpoint;
+  debugInfo += "Target: " + backendURL + "; ";
+  
+  // Send to backend using HTTPS with enhanced error handling
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(15000);
+  
+  HTTPClient http;
+  bool httpBeginResult = http.begin(client, backendURL);
+  
+  if (!httpBeginResult) {
+    esp_camera_fb_return(fb);
+    server.send(500, "application/json", "{\"error\":\"HTTP client init failed\",\"debug\":\"Could not initialize HTTPS client - possible SSL/DNS issue\"}");
+    return;
+  }
+  
+  // Create multipart/form-data payload
+  String boundary = "----ESP32CAMBoundary" + String(millis());
+  String contentType = "multipart/form-data; boundary=" + boundary;
+  
+  // Build multipart body
+  String bodyStart = "--" + boundary + "\r\n";
+  bodyStart += "Content-Disposition: form-data; name=\"image\"; filename=\"capture.jpg\"\r\n";
+  bodyStart += "Content-Type: image/jpeg\r\n\r\n";
+  
+  String bodyEnd = "\r\n--" + boundary + "--\r\n";
+  
+  size_t totalLength = bodyStart.length() + fb->len + bodyEnd.length();
+  
+  // Set headers for multipart
+  http.addHeader("Content-Type", contentType);
+  http.addHeader("User-Agent", "ESP32-CAM-HoneyBadger/2.0");
+  http.addHeader("Content-Length", String(totalLength));
+  http.setTimeout(15000);
+  
+  debugInfo += "Sending multipart data (" + String(totalLength) + " bytes total, " + String(fb->len) + " image bytes); ";
+  
+  // Create complete payload
+  uint8_t* payload = (uint8_t*)malloc(totalLength);
+  if (!payload) {
+    esp_camera_fb_return(fb);
+    server.send(500, "application/json", "{\"error\":\"Memory allocation failed\",\"debug\":\"Could not allocate " + String(totalLength) + " bytes for multipart payload\"}");
+    return;
+  }
+  
+  size_t offset = 0;
+  memcpy(payload + offset, bodyStart.c_str(), bodyStart.length());
+  offset += bodyStart.length();
+  memcpy(payload + offset, fb->buf, fb->len);
+  offset += fb->len;
+  memcpy(payload + offset, bodyEnd.c_str(), bodyEnd.length());
+  
+  unsigned long httpStartTime = millis();
+  int httpResponseCode = http.POST(payload, totalLength);
+  unsigned long httpDuration = millis() - httpStartTime;
+  
+  // Free the payload memory
+  free(payload);
+  
+  debugInfo += "HTTP duration: " + String(httpDuration) + "ms; ";
+  debugInfo += "Response code: " + String(httpResponseCode) + "; ";
+  
+  String response = "";
+  String errorDetails = "";
+  bool success = false;
+  
+  if (httpResponseCode == 200) {
+    response = http.getString();
+    success = true;
+    debugInfo += "Success! Response length: " + String(response.length()) + " chars";
+  } else if (httpResponseCode > 0) {
+    String errorBody = http.getString();
+    debugInfo += "HTTP Error Body: " + errorBody.substring(0, 100); // First 100 chars
+    
+    response = "{\"error\":\"Backend HTTP error\",\"code\":" + String(httpResponseCode);
+    response += ",\"debug\":\"" + debugInfo + "\"";
+    if (errorBody.length() > 0 && errorBody.length() < 200) {
+      // Escape quotes in error body
+      errorBody.replace("\"", "'");
+      response += ",\"serverResponse\":\"" + errorBody + "\"";
+    }
+    response += "}";
+  } else {
+    String errorString = http.errorToString(httpResponseCode);
+    debugInfo += "Connection failed: " + errorString + " (code:" + String(httpResponseCode) + "); ";
+    debugInfo += "WiFi during error: " + String(WiFi.status()) + "; ";
+    debugInfo += "Signal during error: " + String(WiFi.RSSI()) + " dBm";
+    
+    response = "{\"error\":\"Connection failed\",\"details\":\"" + errorString + "\",\"code\":" + String(httpResponseCode);
+    response += ",\"debug\":\"" + debugInfo + "\"}";
+  }
+  
+  // Connection status check
+  if (!success) {
+    if (client.connected()) {
+      debugInfo += "; Client was connected";
+    } else {
+      debugInfo += "; Client connection failed";
+    }
+  }
+  
+  http.end();
+  client.stop();
+  
+  // CRITICAL: Always clean up frame buffer
+  esp_camera_fb_return(fb);
+  fb = nullptr;
+  
+  unsigned long processingTime = millis() - startTime;
+  debugInfo += "; Total time: " + String(processingTime) + "ms";
+  debugInfo += "; Final heap: " + String(ESP.getFreeHeap()) + " bytes";
+  
+  // Add debug info and timing to successful responses
+  if (success && response.startsWith("{") && response.endsWith("}")) {
+    response = response.substring(0, response.length() - 1);
+    response += ",\"processingTime\":" + String(processingTime);
+    response += ",\"httpDuration\":" + String(httpDuration);
+    response += ",\"captureTime\":\"" + String(millis()) + "\"";
+    response += ",\"debug\":\"" + debugInfo + "\"}";
+  }
+  
+  server.send(success ? 200 : 500, "application/json", response);
+}
+
+// Fixed home page with proper string replacement
+void handleRoot() {
+  // Load HTML from PROGMEM and replace placeholders
+  String html = FPSTR(MINIMAL_HOME_HTML);
+  
+  // Replace placeholders with actual values
+  html.replace("{{ESP32_IP}}", WiFi.localIP().toString());
+  html.replace("{{BACKEND_INFO}}", String(backendHost) + ":" + String(backendPort));
+  html.replace("{{MEMORY_INFO}}", String(ESP.getFreeHeap()));
+  
+  server.send(200, "text/html", html);
+}
+
+// Simple test capture endpoint
+void handleCapture() {
+  if (!isCameraInitialized) {
+    server.send(503, "text/plain", "Camera not available");
+    return;
+  }
+  
+  digitalWrite(FLASH_PIN, HIGH);
+  delay(50);
+  camera_fb_t * fb = esp_camera_fb_get();
+  digitalWrite(FLASH_PIN, LOW);
+  
+  if (!fb) {
+    server.send(500, "text/plain", "Capture failed");
+    return;
+  }
+  
+  server.sendHeader("Content-Type", "image/jpeg");
+  server.sendHeader("Content-Length", String(fb->len));
+  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  server.sendHeader("Content-Disposition", "inline; filename=esp32cam.jpg");
+  
+  // Send image data
+  WiFiClient client = server.client();
+  size_t sent = 0;
+  size_t total = fb->len;
+  const size_t chunkSize = 1024;
+  
+  while (sent < total) {
+    size_t toSend = min(chunkSize, total - sent);
+    client.write(fb->buf + sent, toSend);
+    sent += toSend;
+  }
+  
+  esp_camera_fb_return(fb);
+  fb = nullptr;
+  
+  Serial.printf("Image sent: %u bytes\n", total);
+}
+
+// Status endpoint for health checks
+void handleStatus() {
+  String json = "{";
+  json += "\"camera\":" + String(isCameraInitialized ? "true" : "false") + ",";
+  json += "\"wifi\":" + String(isConnectedToWifi ? "true" : "false") + ",";
+  json += "\"wifiStatus\":" + String(WiFi.status()) + ",";
+  json += "\"wifiSignal\":" + String(WiFi.RSSI()) + ",";
+  json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
+  json += "\"freeHeap\":" + String(ESP.getFreeHeap()) + ",";
+  json += "\"freePSRAM\":" + String(ESP.getFreePsram()) + ",";
+  json += "\"uptime\":" + String(millis()) + ",";
+  json += "\"backend\":\"https://" + String(backendHost) + ":" + String(backendPort) + "\"";
+  json += "}";
+  
+  server.send(200, "application/json", json);
+}
+
+// Test backend connectivity without taking a photo
+void handleTestConnection() {
+  Serial.println("=== Testing backend connectivity ===");
+  
+  if (!isConnectedToWifi || WiFi.status() != WL_CONNECTED) {
+    String response = "{\"error\":\"WiFi not connected\",\"wifiStatus\":" + String(WiFi.status()) + "}";
+    server.send(503, "application/json", response);
+    return;
+  }
+  
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(10000);
+  
+  HTTPClient http;
+  String testURL = "https://" + String(backendHost) + ":" + String(backendPort) + "/";
+  
+  Serial.println("Testing connection to: " + testURL);
+  
+  bool httpBeginResult = http.begin(client, testURL);
+  if (!httpBeginResult) {
+    Serial.println("Failed to initialize HTTP client");
+    server.send(500, "application/json", "{\"error\":\"HTTP client init failed\"}");
+    return;
+  }
+  
+  http.setTimeout(10000);
+  unsigned long startTime = millis();
+  int httpResponseCode = http.GET();
+  unsigned long duration = millis() - startTime;
+  
+  String response = "{";
+  response += "\"testURL\":\"" + testURL + "\",";
+  response += "\"responseCode\":" + String(httpResponseCode) + ",";
+  response += "\"duration\":" + String(duration) + ",";
+  response += "\"wifiSignal\":" + String(WiFi.RSSI()) + ",";
+  response += "\"freeHeap\":" + String(ESP.getFreeHeap());
+  
+  if (httpResponseCode > 0) {
+    response += ",\"success\":true";
+    Serial.printf("Connection test successful! Response: %d in %lu ms\n", httpResponseCode, duration);
+  } else {
+    response += ",\"success\":false";
+    response += ",\"error\":\"" + http.errorToString(httpResponseCode) + "\"";
+    Serial.printf("Connection test failed: %s\n", http.errorToString(httpResponseCode).c_str());
+  }
+  
+  response += "}";
+  
+  http.end();
+  client.stop();
+  
+  server.send(200, "application/json", response);
+  Serial.println("=== Connection test completed ===\n");
+}
+
+void setup() {
+  // Initialize pins
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(FLASH_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+  digitalWrite(FLASH_PIN, LOW);
+  
+  // Initialize serial
+  Serial.begin(115200);
+  delay(1000);
+  
+  Serial.println("\n========================================");
+  Serial.println("ESP32-CAM Honey Badger Detector v2.0");
+  Serial.println("Optimized for Speed & Memory Efficiency");
+  Serial.println("========================================");
+  
+  // Print memory info
+  Serial.printf("Free heap at startup: %d bytes\n", ESP.getFreeHeap());
+  Serial.printf("Free PSRAM at startup: %d bytes\n", ESP.getFreePsram());
+  Serial.printf("Flash size: %d bytes\n", ESP.getFlashChipSize());
+  
+  // Initialize camera first (critical component)
+  initCamera();
+  
+  if (!isCameraInitialized) {
+    Serial.println("CRITICAL: Camera failed to initialize. System halted.");
+    while (true) {
+      digitalWrite(LED_PIN, HIGH);
+      delay(200);
+      digitalWrite(LED_PIN, LOW);
+      delay(200);
+    }
+  }
+  
+  // Initialize WiFi
+  initWiFi();
+  
+  // Setup optimized server routes
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/capture", HTTP_GET, handleCapture);
+  server.on("/api/analyze", HTTP_GET, handleAnalyzeAPI);  // Support GET for testing
+  server.on("/api/analyze", HTTP_POST, handleAnalyzeAPI); // Primary POST endpoint
+  server.on("/status", HTTP_GET, handleStatus);           // Health check endpoint
+  server.on("/test", HTTP_GET, handleTestConnection);     // Backend connectivity test
+  
+  // Handle 404 errors efficiently
+  server.onNotFound([]() {
+    server.send(404, "application/json", "{\"error\":\"Endpoint not found\"}");
+  });
+  
+  // Start server
+  server.begin();
+  Serial.println("\nHTTP server started on port 80");
+  
+  if (isConnectedToWifi) {
+    Serial.println("Device ready!");
+    Serial.println("Web interface: http://" + WiFi.localIP().toString());
+    Serial.println("Test capture: http://" + WiFi.localIP().toString() + "/capture");
+    Serial.println("Status check: http://" + WiFi.localIP().toString() + "/status");
+    Serial.println("Backend: https://" + String(backendHost) + ":" + String(backendPort));
+  } else {
+    Serial.println("WARNING: WiFi not connected. Analysis unavailable.");
+  }
+  
+  // Ready indication - 3 fast blinks
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(LED_PIN, HIGH);
+    delay(100);
+    digitalWrite(LED_PIN, LOW);
+    delay(100);
+  }
+  
+  Serial.println("System ready for honey badger detection!");
+  Serial.printf("Final free heap: %d bytes\n", ESP.getFreeHeap());
+}
+
+void loop() {
+  // Handle HTTP requests
+  server.handleClient();
+  
+  // Minimal heartbeat - blink every 5 seconds
+  static unsigned long lastHeartbeat = 0;
+  if (millis() - lastHeartbeat > 5000) {
+    digitalWrite(LED_PIN, HIGH);
+    delay(10);
+    digitalWrite(LED_PIN, LOW);
+    lastHeartbeat = millis();
+    
+    // Memory monitoring (reduced frequency)
+    static int memoryWarnings = 0;
+    if (ESP.getFreeHeap() < 25000) {
+      memoryWarnings++;
+      if (memoryWarnings % 10 == 1) { // Only log every 10th warning to reduce spam
+        Serial.printf("LOW MEMORY WARNING: %d bytes free\n", ESP.getFreeHeap());
+      }
+    } else {
+      memoryWarnings = 0; // Reset warning counter when memory recovers
+    }
+  }
+  
+  // WiFi reconnection check - every 2 minutes
+  static unsigned long lastWifiCheck = 0;
+  if (millis() - lastWifiCheck > 120000) {
+    lastWifiCheck = millis();
+    
+    if (isConnectedToWifi && WiFi.status() != WL_CONNECTED) {
+      Serial.println("WiFi connection lost. Attempting reconnection...");
+      
+      // Quick reconnection attempt
+      WiFi.disconnect();
+      delay(1000);
+      
+      // Simple reconnection for mobile hotspot
+      WiFi.begin(ssid, password);
+      
+      // Short timeout for reconnection
+      int attempts = 0;
+      while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+        delay(500);
+        attempts++;
+      }
+      
+      if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("WiFi reconnected successfully!");
+        Serial.println("IP address: " + WiFi.localIP().toString());
+      } else {
+        Serial.println("WiFi reconnection failed.");
+        isConnectedToWifi = false;
+      }
+    }
+  }
+  
+  // Yield to prevent watchdog timer issues
+  yield();
+}

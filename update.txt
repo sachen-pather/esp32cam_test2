@@ -1,0 +1,548 @@
+#include <Arduino.h>
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <WebServer.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <FS.h>
+
+// Camera pins for AI Thinker ESP32-CAM
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+// LED pin
+#define LED_PIN           33
+
+// WiFi network credentials - Personal WiFi
+const char* ssid = "TP-Link_D6EA"; // Replace with your WiFi name
+const char* password = "Brucechloe_7"; // Replace with your WiFi password
+
+// Create a second AP mode as backup
+const char* ap_ssid = "ESP32-CAM-AP";
+const char* ap_password = "12345678";
+
+// Dropbox API settings
+const char* dropboxApiHost = "content.dropboxapi.com";
+const int dropboxApiPort = 443;
+const char* dropboxUploadEndpoint = "/2/files/upload";
+const char* dropboxAccessToken = "AFseSLabdCTnPGJYgF1r0gTUQESxTzYtpibRdgpkSof2WdFD_0Ev1GbtSfIi7mS01CE3GaqPYhl6gua6vSgJobblSeGGMQm_4xBQ5Uwcz2eatiHVQNu5CbhxHHrn9dExQ8ubXmvRiM5_6JYctWIrYdU7P1a3BDO"; // Replace with your token from paste-2.txt
+
+// Web server on port 80
+WebServer server(80);
+
+// Flag for camera initialization status
+bool isCameraInitialized = false;
+bool isConnectedToWifi = false;
+
+// Function prototypes
+void handleRoot();
+void handleCapture();
+void handleStream();
+void handleCaptureAndUpload();
+bool uploadToDropbox(uint8_t* imageData, size_t imageSize, const char* fileName);
+size_t base64_encode(const unsigned char* in, size_t in_len, unsigned char* out);
+
+void setup() {
+  // Initialize LED
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+  
+  // Initialize serial (for debugging if needed)
+  Serial.begin(115200);
+  while(!Serial);
+  delay(1000);
+  
+  // Configure camera
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+  
+  // Higher quality settings
+  config.frame_size = FRAMESIZE_SVGA;    // 800x600 resolution
+  config.jpeg_quality = 6;               // Better quality (0-63, lower is better)
+  config.fb_count = 2;                   // 2 frame buffers for better performance
+  
+  // Initialize camera
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed with error 0x%x\n", err);
+    // Error blink pattern
+    for (int i = 0; i < 5; i++) {
+      digitalWrite(LED_PIN, HIGH);
+      delay(100);
+      digitalWrite(LED_PIN, LOW);
+      delay(100);
+    }
+    isCameraInitialized = false;
+  } else {
+    Serial.println("Camera initialized successfully");
+    isCameraInitialized = true;
+    
+    // Get sensor and apply better settings
+    sensor_t * s = esp_camera_sensor_get();
+    if (s) {
+      // Adjust sensor parameters for better image quality
+      s->set_brightness(s, 2);         // -2 to 2
+      s->set_contrast(s, -1);          // -2 to 2
+      s->set_saturation(s, 1);         // -2 to 2
+      s->set_sharpness(s, 1);          // -2 to 2
+      s->set_denoise(s, 1);            // 0 to 1
+      s->set_quality(s, 8);            // 0-63 (lower is better quality)
+      s->set_gainceiling(s, GAINCEILING_2X);  // GAINCEILING_2X, 4X, 8X, 16X
+      s->set_whitebal(s, 1);           // 0 = disable, 1 = enable
+      s->set_awb_gain(s, 1);           // 0 = disable, 1 = enable
+      s->set_wb_mode(s, 0);            // 0 to 4
+      s->set_exposure_ctrl(s, 1);      // 0 = disable, 1 = enable
+      s->set_aec2(s, 1);               // 0 = disable, 1 = enable auto bright detection
+      s->set_gain_ctrl(s, 1);          // 0 = disable, 1 = enable
+      
+      Serial.println("Camera settings optimized");
+    }
+    
+    // Success blink pattern
+    digitalWrite(LED_PIN, HIGH);
+    delay(1000);
+    digitalWrite(LED_PIN, LOW);
+  }
+  
+  // Connect to WiFi
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  
+  // Wait for connection with timeout
+  int timeout = 0;
+  while (WiFi.status() != WL_CONNECTED && timeout < 20) { // 10 second timeout
+    delay(500);
+    Serial.print(".");
+    timeout++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println();
+    Serial.print("Connected to WiFi. IP address: ");
+    Serial.println(WiFi.localIP());
+    isConnectedToWifi = true;
+    
+    // WiFi connected blink pattern
+    for (int i = 0; i < 2; i++) {
+      digitalWrite(LED_PIN, HIGH);
+      delay(500);
+      digitalWrite(LED_PIN, LOW);
+      delay(500);
+    }
+  } else {
+    Serial.println();
+    Serial.println("Failed to connect to WiFi. Starting AP mode as fallback.");
+    isConnectedToWifi = false;
+    
+    // Set up Access Point as a fallback
+    WiFi.softAP(ap_ssid, ap_password);
+    IPAddress IP = WiFi.softAPIP();
+    Serial.print("AP IP address: ");
+    Serial.println(IP);
+    
+    // AP mode blink pattern
+    for (int i = 0; i < 3; i++) {
+      digitalWrite(LED_PIN, HIGH);
+      delay(200);
+      digitalWrite(LED_PIN, LOW);
+      delay(200);
+    }
+  }
+  
+  // Set up web server routes
+  server.on("/", handleRoot);
+  server.on("/capture", handleCapture);
+  server.on("/stream", handleStream);
+  server.on("/capture-upload", handleCaptureAndUpload);
+  
+  // Start server
+  server.begin();
+  Serial.println("HTTP server started");
+  
+  // Server started blink pattern
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(LED_PIN, HIGH);
+    delay(200);
+    digitalWrite(LED_PIN, LOW);
+    delay(200);
+  }
+}
+
+void loop() {
+  // Handle client requests
+  server.handleClient();
+  
+  // Blink LED periodically to show the server is running
+  static unsigned long lastBlink = 0;
+  if (millis() - lastBlink > 3000) {
+    digitalWrite(LED_PIN, HIGH);
+    delay(50);
+    digitalWrite(LED_PIN, LOW);
+    lastBlink = millis();
+  }
+}
+
+// Serve the main page with enhanced UI
+void handleRoot() {
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<title>ESP32-CAM Web Server</title>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<style>";
+  html += "body{font-family:Arial;text-align:center;margin:0;background-color:#f4f4f4;}";
+  html += ".container{max-width:800px;margin:0 auto;padding:20px;}";
+  html += "img{max-width:100%;width:auto;height:auto;border-radius:10px;border:1px solid #ddd;}";
+  html += "button{background-color:#4CAF50;border:none;color:white;padding:15px 32px;";
+  html += "text-align:center;text-decoration:none;display:inline-block;font-size:16px;";
+  html += "margin:10px 5px;cursor:pointer;border-radius:8px;box-shadow:0 4px 8px rgba(0,0,0,0.1);}";
+  html += "button:hover{background-color:#45a049;transform:translateY(-2px);transition:0.2s;}";
+  html += "h1{color:#333;text-shadow:1px 1px 2px #ccc;}";
+  html += ".button-container{margin:20px 0;}";
+  html += ".dropbox{background-color:#0061ff;}";
+  html += ".dropbox:hover{background-color:#0055e1;}";
+  html += "</style></head>";
+  html += "<body><div class='container'>";
+  html += "<h1>ESP32-CAM Web Server</h1>";
+  
+  if (!isCameraInitialized) {
+    html += "<p style='color:red;font-weight:bold;padding:20px;background-color:#ffeeee;border-radius:5px;'>Error: Camera initialization failed</p>";
+  } else {
+    html += "<div class='button-container'>";
+    html += "<button onclick=\"window.location.href='/capture'\">Take Photo</button>";
+    html += "<button onclick=\"window.location.href='/stream'\">Live Stream</button>";
+    if (isConnectedToWifi) {
+      html += "<button class='dropbox' onclick=\"window.location.href='/capture-upload'\">Capture & Upload to Dropbox</button>";
+    }
+    html += "</div>";
+    
+    if (!isConnectedToWifi) {
+      html += "<p style='color:orange;font-weight:bold;padding:10px;background-color:#fff9e6;border-radius:5px;'>";
+      html += "Warning: Not connected to WiFi. Dropbox upload not available. Running in AP mode.</p>";
+    } else {
+      html += "<p>Camera is working! Click a button above to start.</p>";
+    }
+    
+    // Show camera info
+    html += "<div style='margin-top:30px;text-align:left;background-color:#e8e8e8;padding:15px;border-radius:8px;'>";
+    html += "<h3>Camera Information:</h3>";
+    html += "<p>Resolution: 800x600 (SVGA)</p>";
+    html += "<p>Quality: High</p>";
+    
+    if (isConnectedToWifi) {
+      html += "<p>WiFi Status: Connected to " + String(ssid) + "</p>";
+      html += "<p>ESP32-CAM IP: " + WiFi.localIP().toString() + "</p>";
+    } else {
+      html += "<p>WiFi Status: Running as Access Point</p>";
+      html += "<p>ESP32-CAM IP: " + WiFi.softAPIP().toString() + "</p>";
+    }
+    
+    html += "</div>";
+  }
+  
+  html += "</div></body></html>";
+  
+  server.send(200, "text/html", html);
+}
+
+// Capture and send a photo
+void handleCapture() {
+  if (!isCameraInitialized) {
+    server.send(500, "text/plain", "Camera not initialized");
+    return;
+  }
+  
+  digitalWrite(LED_PIN, HIGH); // Turn on LED for photo
+  
+  // Capture frame
+  camera_fb_t * fb = esp_camera_fb_get();
+  digitalWrite(LED_PIN, LOW); // Turn off LED
+  
+  if (!fb) {
+    Serial.println("Camera capture failed");
+    server.send(500, "text/plain", "Camera capture failed");
+    return;
+  }
+  
+  // Send the image
+  server.sendHeader("Content-Type", "image/jpeg");
+  server.sendHeader("Content-Disposition", "inline; filename=capture.jpg");
+  server.sendHeader("Content-Length", String(fb->len));
+  server.send_P(200, "image/jpeg", (const char*)fb->buf, fb->len);
+  
+  // Return the frame buffer back to be reused
+  esp_camera_fb_return(fb);
+}
+
+// Handle streaming with enhanced UI
+void handleStream() {
+  if (!isCameraInitialized) {
+    server.send(500, "text/plain", "Camera not initialized");
+    return;
+  }
+  
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<title>ESP32-CAM Stream</title>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<style>";
+  html += "body{font-family:Arial;text-align:center;margin:0;background-color:#f4f4f4;}";
+  html += ".container{max-width:800px;margin:0 auto;padding:20px;}";
+  html += "img{max-width:100%;width:auto;height:auto;border-radius:10px;border:1px solid #ddd;}";
+  html += "button{background-color:#4CAF50;border:none;color:white;padding:12px 24px;";
+  html += "text-align:center;text-decoration:none;display:inline-block;font-size:16px;";
+  html += "margin:10px 5px;cursor:pointer;border-radius:8px;box-shadow:0 4px 8px rgba(0,0,0,0.1);}";
+  html += "button:hover{background-color:#45a049;transform:translateY(-2px);transition:0.2s;}";
+  html += "h1{color:#333;text-shadow:1px 1px 2px #ccc;}";
+  html += "</style></head>";
+  html += "<body><div class='container'>";
+  html += "<h1>ESP32-CAM Live Stream</h1>";
+  html += "<p><button onclick=\"window.location.href='/'\">Back to Home</button></p>";
+  html += "<div style='margin:10px 0;padding:10px;background:white;border-radius:10px;box-shadow:0 4px 8px rgba(0,0,0,0.1);'>";
+  html += "<img src='/capture' id='stream' alt='Camera Stream'>";
+  html += "</div>";
+  html += "<p style='font-size:14px;color:#666;'>Stream refreshes automatically (5 FPS)</p>";
+  html += "<script>";
+  html += "var img = document.getElementById('stream');";
+  html += "function refreshImage() {";
+  html += "  img.src = '/capture?t=' + new Date().getTime();";
+  html += "}";
+  html += "setInterval(refreshImage, 200);"; // 200ms refresh (5 fps)
+  html += "</script>";
+  html += "</div></body></html>";
+  
+  server.send(200, "text/html", html);
+}
+
+// Capture image and upload to Dropbox
+void handleCaptureAndUpload() {
+  if (!isCameraInitialized) {
+    server.send(500, "text/plain", "Camera not initialized");
+    return;
+  }
+  
+  if (!isConnectedToWifi) {
+    server.send(500, "text/plain", "Not connected to WiFi. Cannot upload to Dropbox.");
+    return;
+  }
+  
+  // Turn on LED
+  digitalWrite(LED_PIN, HIGH);
+  
+  // Capture frame
+  camera_fb_t * fb = esp_camera_fb_get();
+  
+  // Turn off LED
+  digitalWrite(LED_PIN, LOW);
+  
+  if (!fb) {
+    Serial.println("Camera capture failed");
+    server.send(500, "text/plain", "Camera capture failed");
+    return;
+  }
+  
+  // Generate a unique filename based on timestamp
+  char filename[32];
+  unsigned long timestamp = millis();
+  sprintf(filename, "/honey-badger/esp32cam_%lu.jpg", timestamp);
+  
+  // Upload to Dropbox
+  bool uploadSuccess = uploadToDropbox(fb->buf, fb->len, filename);
+  
+  // HTML response with result
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<title>ESP32-CAM - Dropbox Upload</title>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<style>";
+  html += "body{font-family:Arial;text-align:center;margin:0;background-color:#f4f4f4;}";
+  html += ".container{max-width:800px;margin:0 auto;padding:20px;}";
+  html += "img{max-width:100%;height:auto;border-radius:10px;border:1px solid #ddd;margin-top:20px;}";
+  html += "button{background-color:#4CAF50;border:none;color:white;padding:12px 24px;";
+  html += "text-align:center;text-decoration:none;display:inline-block;font-size:16px;";
+  html += "margin:10px 5px;cursor:pointer;border-radius:8px;box-shadow:0 4px 8px rgba(0,0,0,0.1);}";
+  html += "button:hover{background-color:#45a049;transform:translateY(-2px);transition:0.2s;}";
+  html += "h1{color:#333;text-shadow:1px 1px 2px #ccc;}";
+  html += ".status{padding:15px;border-radius:8px;margin:20px 0;}";
+  html += ".success{background-color:#e7f7e7;color:#2e7d32;border:1px solid #c8e6c9;}";
+  html += ".failure{background-color:#ffebee;color:#c62828;border:1px solid #ffcdd2;}";
+  html += "</style></head>";
+  html += "<body><div class='container'>";
+  html += "<h1>ESP32-CAM - Dropbox Upload</h1>";
+  
+  if (uploadSuccess) {
+    html += "<div class='status success'>";
+    html += "<h2>Upload Successful!</h2>";
+    html += "<p>Image was successfully uploaded to Dropbox as: " + String(filename) + "</p>";
+    html += "</div>";
+  } else {
+    html += "<div class='status failure'>";
+    html += "<h2>Upload Failed</h2>";
+    html += "<p>Failed to upload image to Dropbox. Please check your connection and access token.</p>";
+    html += "</div>";
+  }
+  
+  html += "<p><button onclick=\"window.location.href='/'\">Back to Home</button></p>";
+  html += "<div style='margin-top:20px;'>";
+  html += "<h3>Captured Image:</h3>";
+  html += "<img src='data:image/jpeg;base64,";
+  
+  // Convert image to base64 to display in the page
+  // Use a function to convert base64 in chunks to avoid buffer issues
+  uint8_t *buf = fb->buf;
+  size_t len = fb->len;
+  size_t index = 0;
+  size_t chunkSize = 1024; // Process in chunks to avoid memory issues
+  
+  while (index < len) {
+    size_t currentChunk = ((index + chunkSize) > len) ? (len - index) : chunkSize;
+    char base64Buffer[1024 + 512]; // Extra space for conversion overhead
+    size_t base64Len = base64_encode((const unsigned char*)(buf + index), currentChunk, (unsigned char*)base64Buffer);
+    base64Buffer[base64Len] = 0;
+    html += base64Buffer;
+    index += currentChunk;
+  }
+  
+  html += "' alt='Captured image'>";
+  html += "</div>";
+  html += "</div></body></html>";
+  
+  server.send(200, "text/html", html);
+  
+  // Free the memory
+  esp_camera_fb_return(fb);
+}
+
+// Helper function for base64 encoding
+size_t base64_encode(const unsigned char* in, size_t in_len, unsigned char* out) {
+  const char base64_chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  size_t i = 0, j = 0;
+  size_t in_len_remaining = in_len;
+  
+  while (in_len_remaining >= 3) {
+    out[j++] = base64_chars[in[i] >> 2];
+    out[j++] = base64_chars[((in[i] & 0x03) << 4) | ((in[i + 1] & 0xf0) >> 4)];
+    out[j++] = base64_chars[((in[i + 1] & 0x0f) << 2) | ((in[i + 2] & 0xc0) >> 6)];
+    out[j++] = base64_chars[in[i + 2] & 0x3f];
+    i += 3;
+    in_len_remaining -= 3;
+  }
+  
+  if (in_len_remaining) {
+    out[j++] = base64_chars[in[i] >> 2];
+    
+    if (in_len_remaining == 1) {
+      out[j++] = base64_chars[((in[i] & 0x03) << 4)];
+      out[j++] = '=';
+    } else {
+      out[j++] = base64_chars[((in[i] & 0x03) << 4) | ((in[i + 1] & 0xf0) >> 4)];
+      out[j++] = base64_chars[((in[i + 1] & 0x0f) << 2)];
+    }
+    
+    out[j++] = '=';
+  }
+  
+  return j;
+}
+
+// Upload image to Dropbox
+bool uploadToDropbox(uint8_t* imageData, size_t imageSize, const char* fileName) {
+  Serial.printf("Uploading image to Dropbox: %s\n", fileName);
+  
+  // Create a secure WiFi client
+  WiFiClientSecure client;
+  
+  // Skip certificate verification (for simplicity - not recommended for production)
+  client.setInsecure();
+  
+  Serial.printf("Connecting to %s:%d...\n", dropboxApiHost, dropboxApiPort);
+  
+  if (!client.connect(dropboxApiHost, dropboxApiPort)) {
+    Serial.println("Connection failed");
+    return false;
+  }
+  
+  Serial.println("Connected to Dropbox API server");
+  
+  // Prepare JSON for Dropbox API parameters
+  String dropboxArgs = "{\"path\":\"" + String(fileName) + "\",\"mode\":\"add\",\"autorename\":true,\"mute\":false}";
+  
+  // Create HTTP POST request
+  String requestHeaders = "POST " + String(dropboxUploadEndpoint) + " HTTP/1.1\r\n";
+  requestHeaders += "Host: " + String(dropboxApiHost) + "\r\n";
+  requestHeaders += "Authorization: Bearer " + String(dropboxAccessToken) + "\r\n";
+  requestHeaders += "Dropbox-API-Arg: " + dropboxArgs + "\r\n";
+  requestHeaders += "Content-Type: application/octet-stream\r\n";
+  requestHeaders += "Content-Length: " + String(imageSize) + "\r\n";
+  requestHeaders += "Connection: close\r\n\r\n";
+  
+  // Send request headers
+  client.print(requestHeaders);
+  
+  // Send image data in chunks to avoid buffer issues
+  size_t chunkSize = 1024;
+  size_t sentBytes = 0;
+  
+  while (sentBytes < imageSize) {
+    size_t currentChunk = ((sentBytes + chunkSize) > imageSize) ? (imageSize - sentBytes) : chunkSize;
+    client.write(imageData + sentBytes, currentChunk);
+    sentBytes += currentChunk;
+    
+    // Show upload progress
+    Serial.printf("Uploaded %d of %d bytes\n", sentBytes, imageSize);
+  }
+  
+  Serial.println("Waiting for response...");
+  
+  // Wait for server response
+  unsigned long timeout = millis();
+  while (client.connected() && millis() - timeout < 10000) {
+    if (client.available()) {
+      String line = client.readStringUntil('\n');
+      Serial.println(line);
+      
+      // Check for successful response (look for 200 OK in the response)
+      if (line.indexOf("HTTP/1.1 200") >= 0 || line.indexOf("HTTP/1.1 201") >= 0) {
+        Serial.println("Upload successful!");
+        return true;
+      }
+      
+      // If we get a different status code, log it and continue reading
+      if (line.indexOf("HTTP/1.1") >= 0 && line.indexOf("HTTP/1.1 200") < 0 && line.indexOf("HTTP/1.1 201") < 0) {
+        Serial.printf("Server returned error: %s\n", line.c_str());
+      }
+    }
+  }
+  
+  Serial.println("Upload failed or timed out");
+  return false;
+}
